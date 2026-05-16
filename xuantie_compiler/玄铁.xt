@@ -251,8 +251,8 @@
     设 clang结果 = 执(clang指令)
     若 非 clang结果.成功 或 非 文件.存在?(o路径) {
         示("LLVM 编译为对象文件失败: " & clang结果.错误)
+        示("  IR文件保留于: " & ll路径)
         若 clang结果.成功 { 示("错误：未找到生成的对象文件 " & o路径) }
-        执("cmd /c del /q \"" & ll路径 & "\" 2>nul")
         xt_arena_destroy(池)
         终 1
     }
