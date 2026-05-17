@@ -308,6 +308,9 @@ XTArena* xt_arena_new(size_t size);
 void* xt_arena_alloc(size_t size, uint32_t type_id);
 XTValue xt_arena_use(XTArena* arena);
 XTValue xt_arena_destroy(XTArena* arena);
+XTArena* xt_arena_disable(void);
+void xt_arena_restore(XTArena* arena);
+void xt_retain_forever(XTValue val);
 
 // --- 类型转换与操作 ---
 

@@ -428,7 +428,7 @@ XTArena* xt_arena_new(size_t size) {
     arena->header.type_id = XT_TYPE_ARENA;
     arena->header.magic = XT_MAGIC;
 
-    arena->buffer = (char*)calloc(1, size);
+    arena->buffer = (char*)malloc(size);
     if (!arena->buffer) { free(arena); return NULL; }
     arena->size = size;
     arena->offset = 0;
@@ -447,7 +447,7 @@ void* xt_arena_alloc_raw(size_t size) {
     
     // 如果当前块空间不足，自动开辟新块并挂载到链表
     if (g_current_arena->offset + size > g_current_arena->size) {
-        size_t next_size = (size > 1024 * 1024) ? size : 1024 * 1024;
+        size_t next_size = (size > 100 * 1024 * 1024) ? size : 100 * 1024 * 1024;
         XTArena* new_block = xt_arena_new(next_size);
         if (!new_block) { fprintf(stderr, "Fatal error: out of memory (Arena raw expand)\n"); exit(1); }
         
@@ -496,6 +496,16 @@ void* xt_arena_alloc(size_t size, uint32_t type_id) {
 XTValue xt_arena_use(XTArena* arena) {
     g_current_arena = arena;
     return XT_NULL;
+}
+
+XTArena* xt_arena_disable(void) {
+    XTArena* old = g_current_arena;
+    g_current_arena = NULL;
+    return old;
+}
+
+void xt_arena_restore(XTArena* arena) {
+    g_current_arena = arena;
 }
 
 /**
@@ -809,7 +819,7 @@ void xt_retain(XTValue val) {
  * @brief 减少引用计数 (ARC Release)
  */
 void xt_release(XTValue val) {
-    if (XT_IS_INT(val)) return; // P0: 极速路径，跳过标记指针
+    if (XT_IS_INT(val)) return;
     if (xt_is_real_ptr(val)) {
         xt_check_obj((void*)val);
         XTObject* obj = (XTObject*)val;
@@ -824,6 +834,12 @@ void xt_release(XTValue val) {
             atomic_store(&obj->ref_count, 0);
         }
     }
+}
+
+void xt_retain_forever(XTValue val) {
+    if (!xt_is_real_ptr(val)) return;
+    XTObject* obj = (XTObject*)val;
+    atomic_store(&obj->ref_count, XT_REF_COUNT_IMMORTAL);
 }
 
 // --- 类型转换核心逻辑 ---

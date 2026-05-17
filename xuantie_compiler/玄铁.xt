@@ -11,6 +11,9 @@
 外 函 xt_arena_new(大小: 整): 整
 外 函 xt_arena_use(池: 整): 整
 外 函 xt_arena_destroy(池: 整): 整
+外 函 xt_arena_disable(): 整
+外 函 xt_arena_restore(池: 整): 整
+外 函 xt_retain_forever(对象: 整): 整
 外 函 xt_get_args(): 数组
 外 函 xt_get_temp_path(): 字
 
@@ -177,9 +180,8 @@
         严格度 = 配置["严格度"]
     }
 
-    // 初始化 10MB 的 Arena 用于自举编译器
-    设 池 = xt_arena_new(500 * 1024 * 1024)
-    xt_arena_use(池)
+    // 纯 ARC 模式
+    设 池 = 0
 
     设 读结果 = 文件.读(路径)
     若 非 读结果.成功 {
@@ -212,6 +214,7 @@
     // 编译 (生成 LLVM IR)
     若 输出信息 { 示("正在生成 LLVM IR") }
     设 编译 = 造 编译器()
+    xt_retain_forever(编译)  // 编译器实例永生——方法内 此 的释放均为空操作
     编译.严格度 = 严格度
     编译.编译程序(程序树, 路径)
     若 输出信息 { 示("LLVM IR 生成完成") }
