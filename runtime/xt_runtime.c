@@ -360,12 +360,12 @@ XTValue xt_string_char_count(XTValue str_val) {
 XTValue xt_string_to_hex_string(XTValue str_val) {
     if (!XT_IS_PTR(str_val) || str_val == XT_NULL) return XT_NULL;
     XTString* s = (XTString*)str_val;
-    
+
     size_t new_len = s->length * 3;
     char* buf = (char*)malloc(new_len + 1);
     char* p = buf;
     const char* hex = "0123456789ABCDEF";
-    
+
     for (size_t i = 0; i < s->length; i++) {
         unsigned char b = (unsigned char)s->data[i];
         *p++ = '\\';
@@ -373,7 +373,7 @@ XTValue xt_string_to_hex_string(XTValue str_val) {
         *p++ = hex[b & 0x0F];
     }
     *p = '\0';
-    
+
     XTString* res = xt_string_new_len(buf, new_len);
     free(buf);
     return (XTValue)res;
