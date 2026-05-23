@@ -490,7 +490,6 @@ func (l *Lexer) readString(quote rune) string {
 			case '}':
 				out.WriteRune('}')
 			case '#':
-				out.WriteRune('\\')
 				out.WriteRune('#')
 			default:
 				out.WriteRune('\\')

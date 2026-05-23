@@ -95,6 +95,7 @@ typedef uintptr_t XTValue;
 #define XT_TYPE_TASK      11 ///< 异步任务 (Task)
 #define XT_TYPE_CHANNEL   12 ///< 并发通道 (Channel)
 #define XT_TYPE_ARENA     13 ///< 区域分配器 (Arena)
+#define XT_TYPE_SOCKET    14 ///< 网络 socket
 
 // 内存管理常量
 #define XT_REF_COUNT_IMMORTAL 0x7FFFFFFF ///< Arena 对象的引用计数，防止被释放
@@ -139,12 +140,33 @@ typedef struct {
 typedef struct {
     XTObject header;
     XTValue result;
-    int status; // 0: 运行中, 1: 已完成, 2: 失败
+    int status;   // 0: 运行中, 1: 已完成, 2: 失败
+    int pool_id;  // 线程池任务 ID，-1 表示未提交
 } XTTask;
 
+// 异步任务 API (v0.2: 对接线程池)
+XTTask* xt_async_spawn(void* func_ptr, XTValue arg);
+XTValue xt_async_wait(XTTask* task);
+
 /**
- * @brief 通道结构 (简单环形队列)
+ * @brief 通道结构 (简单环形队列，v0.2 已加锁)
  */
+#if defined(_WIN32)
+#include <windows.h>
+typedef CRITICAL_SECTION xt_chan_mutex_t;
+#define XT_CHAN_MUTEX_INIT(m)   InitializeCriticalSection(m)
+#define XT_CHAN_MUTEX_DESTROY(m) DeleteCriticalSection(m)
+#define XT_CHAN_MUTEX_LOCK(m)    EnterCriticalSection(m)
+#define XT_CHAN_MUTEX_UNLOCK(m)  LeaveCriticalSection(m)
+#else
+#include <pthread.h>
+typedef pthread_mutex_t xt_chan_mutex_t;
+#define XT_CHAN_MUTEX_INIT(m)   pthread_mutex_init(m, NULL)
+#define XT_CHAN_MUTEX_DESTROY(m) pthread_mutex_destroy(m)
+#define XT_CHAN_MUTEX_LOCK(m)    pthread_mutex_lock(m)
+#define XT_CHAN_MUTEX_UNLOCK(m)  pthread_mutex_unlock(m)
+#endif
+
 typedef struct {
     XTObject header;
     XTValue* buffer;
@@ -152,8 +174,18 @@ typedef struct {
     size_t capacity;
     size_t head;
     size_t tail;
+    xt_chan_mutex_t mu;   // 线程安全：保护所有字段
 } XTChannel;
 
+/**
+ * @brief 网络 Socket 对象 (v0.2)
+ */
+typedef struct {
+    XTObject header;
+    void* sock;       // 平台 socket 句柄 (SOCKET/int)
+    int is_closed;    // 是否已关闭
+    int is_listener;  // 是否为监听 socket
+} XTSocket;
 
 /**
  * @brief 装箱整数结构 (较少直接使用，优先使用标记指针)

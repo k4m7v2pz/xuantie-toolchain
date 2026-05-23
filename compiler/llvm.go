@@ -55,6 +55,7 @@ type LLVMCompiler struct {
 	declaredGlobals map[string]bool
 	errors         []string       // 编译错误列表，进入 LLVM/clang 前必须检查
 	funcReturnTypes map[string]string // 函数名 → 内部返回类型
+	asyncCounter    int               // 异步/并行函数的唯一编号
 }
 
 func (c *LLVMCompiler) Errors() []string { return c.errors }
@@ -110,7 +111,7 @@ func NewLLVMCompiler(program *ast.Program) *LLVMCompiler {
 	c.declaredGlobals["听"] = true
 	c.symbolTable["连"] = SymbolInfo{AddrReg: "@\"xt_connect\"", IsGlobal: true, Type: "i64"}
 	c.declaredGlobals["连"] = true
-	c.symbolTable["等待"] = SymbolInfo{AddrReg: "@\"xt_wait\"", IsGlobal: true, Type: "i64"}
+	c.symbolTable["等待"] = SymbolInfo{AddrReg: "@\"xt_async_wait\"", IsGlobal: true, Type: "i64"}
 	c.declaredGlobals["等待"] = true
 
 	return c
@@ -242,7 +243,8 @@ func (c *LLVMCompiler) Compile() string {
 	res.WriteString("declare i64 @xt_channel_receive(i64)\n")
 	res.WriteString("declare %XTString* @xt_json_serialize(i64)\n")
 	res.WriteString("declare i64 @xt_json_deserialize(%XTString*)\n")
-	res.WriteString("declare i64 @xt_wait(i64)\n\n")
+	res.WriteString("declare i64 @xt_async_wait(i64)\n")
+	res.WriteString("declare i64 @xt_async_spawn(i8*, i64)\n\n")
 
 	// 4. 写入全局变量定义
 	res.Write(c.globalOutput.Bytes())
@@ -304,7 +306,12 @@ func (c *LLVMCompiler) mapTypeAnnotation(xtType string) string {
 		return "double"
 	case "判":
 		return "i1"
+	case "字", "数组", "字典", "结果", "字节", "任务", "道":
+		return "i64" // 堆对象类型，统一用 i64 标记指针
 	default:
+		if xtType != "" {
+			c.addError("未知的类型注解 '%s'——将默认映射为 i64", xtType)
+		}
 		return "i64"
 	}
 }
@@ -879,6 +886,7 @@ func (c *LLVMCompiler) compileFunctionStatement(s *ast.FunctionStatement) {
 	c.allocaSet = make(map[string]bool)
 	oldFunc := c.currentFunc
 	c.currentFunc = s.Name.Value
+	// 快照全局符号表，函数退出时恢复——隔离函数间的符号空间
 	oldTable := make(map[string]SymbolInfo)
 	for k, v := range c.symbolTable {
 		oldTable[k] = v
@@ -1991,11 +1999,15 @@ func (c *LLVMCompiler) compileExpression(expr ast.Expression) (string, string, s
 		c.emit("  %s = call i64 @xt_connect(i64 %s)", res, addrXt)
 		c.emit("  call void @xt_release(i64 %s)", addrXt)
 		return res, "i64", ""
+	case *ast.AsyncExpression:
+		return c.compileAsync(e)
+	case *ast.ParallelExpression:
+		return c.compileParallel(e)
 	case *ast.AwaitExpression:
 		taskReg, taskType, _ := c.compileExpression(e.Value)
 		taskXt := c.ensureI64(taskReg, taskType)
 		res := c.nextReg()
-		c.emit("  %s = call i64 @xt_wait(i64 %s)", res, taskXt)
+		c.emit("  %s = call i64 @xt_async_wait(i64 %s)", res, taskXt)
 		c.emit("  call void @xt_release(i64 %s)", taskXt)
 		return res, "i64", ""
 	case *ast.InfixExpression:
@@ -2765,6 +2777,81 @@ func (c *LLVMCompiler) compileComplexAssignStatement(s *ast.ComplexAssignStateme
 	}
 }
 
+// compileAsync 将异步块编译为独立 LLVM 函数并提交到线程池
+func (c *LLVMCompiler) compileAsync(e *ast.AsyncExpression) (string, string, string) {
+	asyncID := c.asyncCounter; c.asyncCounter++
+	funcName := fmt.Sprintf("@\"__async_%d\"", asyncID)
+
+	// 生成异步函数体
+	oldOutput := c.output
+	oldFunc := c.currentFunc
+	oldLabel := c.currentLabel
+	c.output = bytes.Buffer{}
+	c.currentFunc = fmt.Sprintf("__async_%d", asyncID)
+	c.emit("define i64 %s(i64) {", funcName)
+	c.emit("entry:")
+	c.currentLabel = "entry"
+	for _, stmt := range e.Block {
+		c.compileStatement(stmt)
+	}
+	c.emit("  ret i64 0")
+	c.emit("}")
+	asyncFuncIR := c.output.String()
+	c.output = oldOutput
+	c.currentFunc = oldFunc
+	c.currentLabel = oldLabel
+
+	// 将生成的函数追加到全局输出
+	c.globalOutput.WriteString(asyncFuncIR + "\n")
+
+	// 提交到线程池: xt_async_spawn(func_ptr, 0)
+	fRawReg := c.nextReg()
+	c.emit("  %s = bitcast i64 (i64)* %s to i8*", fRawReg, funcName)
+	res := c.nextReg()
+	c.emit("  %s = call i64 @xt_async_spawn(i8* %s, i64 0)", res, fRawReg)
+	return res, "i64", ""
+}
+
+// compileParallel 将并行块编译为多个独立 LLVM 函数并等待全部完成
+func (c *LLVMCompiler) compileParallel(e *ast.ParallelExpression) (string, string, string) {
+	if len(e.Blocks) == 0 {
+		return "2", "i64", "" // XT_FALSE
+	}
+	// 逐个编译并提交
+	taskRegs := []string{}
+	for _, block := range e.Blocks {
+		pid := c.asyncCounter; c.asyncCounter++
+		funcName := fmt.Sprintf("@\"__parallel_%d\"", pid)
+		oldOutput := c.output; oldFunc := c.currentFunc; oldLabel := c.currentLabel
+		c.output = bytes.Buffer{}
+		c.currentFunc = fmt.Sprintf("__parallel_%d", pid)
+		c.emit("define i64 %s(i64) {", funcName)
+		c.emit("entry:"); c.currentLabel = "entry"
+		for _, stmt := range block {
+			c.compileStatement(stmt)
+		}
+		c.emit("  ret i64 0"); c.emit("}")
+		c.globalOutput.WriteString(c.output.String() + "\n")
+		c.output = oldOutput; c.currentFunc = oldFunc; c.currentLabel = oldLabel
+
+		fRaw := c.nextReg()
+		c.emit("  %s = bitcast i64 (i64)* %s to i8*", fRaw, funcName)
+		taskReg := c.nextReg()
+		c.emit("  %s = call i64 @xt_async_spawn(i8* %s, i64 0)", taskReg, fRaw)
+		taskRegs = append(taskRegs, taskReg)
+	}
+	// 等待全部完成
+	resArr := c.nextReg()
+	c.emit("  %s = call i64 @xt_array_new(i64 %d)", resArr, len(e.Blocks))
+	for _, tr := range taskRegs {
+		waited := c.nextReg()
+		c.emit("  %s = call i64 @xt_async_wait(i64 %s)", waited, tr)
+		c.emit("  call void @xt_array_append(i64 %s, i64 %s)", resArr, waited)
+		c.emit("  call void @xt_release(i64 %s)", waited)
+	}
+	return resArr, "i64", ""
+}
+
 func (c *LLVMCompiler) compileExternalFunctionStatement(s *ast.ExternalFunctionStatement) {
 	retType := "i64"
 	switch s.ReturnType {
@@ -2832,6 +2919,7 @@ func (c *LLVMCompiler) compileMethodStatement(className string, s *ast.FunctionS
 	c.allocaSet = make(map[string]bool)
 	oldFunc := c.currentFunc
 	c.currentFunc = s.Name.Value
+	// 快照全局符号表，函数退出时恢复——隔离函数间的符号空间
 	oldTable := make(map[string]SymbolInfo)
 	for k, v := range c.symbolTable {
 		oldTable[k] = v

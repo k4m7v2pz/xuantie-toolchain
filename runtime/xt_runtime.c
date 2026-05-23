@@ -14,6 +14,8 @@
 
 #define __USE_MINGW_ANSI_STDIO 1 // 强制 MinGW 使用兼容 C99 的 stdio 实现，支持 %lld 和 UTF-8
 #include "xt_runtime.h"
+#include "xt_threadpool.h"
+#include "xt_net.h"
 #include <inttypes.h>
 #include <time.h>
 #include <locale.h>
@@ -48,8 +50,20 @@ typedef struct XTArena {
 
 // 全局状态
 static XTArena* g_current_arena = NULL; ///< 当前活动的内存区域
+
+#ifdef _WIN32
+static __declspec(thread) XTArena* g_thread_arena = NULL; // TLS: 每线程独立 Arena
+#else
+static __thread XTArena* g_thread_arena = NULL;
+#endif
+
 static XTValue g_xt_args = XT_NULL;      ///< 命令行参数缓存
 static XTWeakSlot* g_weak_slots = NULL;   ///< 弱引用旁路链表头部
+static xt_chan_mutex_t g_weak_mutex;      ///< 保护 g_weak_slots 的锁
+
+// 弱引用全局锁操作（用于 xt_weak_init / xt_dict_weak_init / xt_weak_clear）
+#define WEAK_LOCK()   XT_CHAN_MUTEX_LOCK(&g_weak_mutex)
+#define WEAK_UNLOCK() XT_CHAN_MUTEX_UNLOCK(&g_weak_mutex)
 
 // 函数原型声明
 XTArena* xt_arena_new(size_t size);
@@ -71,6 +85,9 @@ void xt_init() {
     setlocale(LC_ALL, ".UTF8");  // 设置 C 运行时区域，增强 UTF-8 兼容性
     fflush(stdout);              // 清空初始缓冲区
 #endif
+    XT_CHAN_MUTEX_INIT(&g_weak_mutex);  // 初始化弱引用全局锁
+    xt_threadpool_init(0);              // 初始化线程池（0=自动检测CPU核数）
+    xt_net_init();                      // 初始化网络子系统
 }
 
 /**
@@ -608,8 +625,10 @@ void xt_weak_init(XTValue* slot_addr, XTValue obj_val) {
     if (!ws) return;
     ws->obj = (void*)obj;
     ws->slot_addr = slot_addr;
+    WEAK_LOCK();
     ws->next = g_weak_slots;
     g_weak_slots = ws;
+    WEAK_UNLOCK();
 }
 
 /**
@@ -656,8 +675,10 @@ void xt_dict_weak_init(XTValue dict_val, XTValue key, XTValue obj_val) {
     ws->dict_val = dict_val;
     ws->dict_key = key;
     xt_retain(key);
+    WEAK_LOCK();
     ws->next = g_weak_slots;
     g_weak_slots = ws;
+    WEAK_UNLOCK();
 }
 
 /**
@@ -753,14 +774,19 @@ static void xt_free_obj(XTObject* obj) {
         }
         case XT_TYPE_CHANNEL: {
             XTChannel* chan = (XTChannel*)obj;
+            XT_CHAN_MUTEX_DESTROY(&chan->mu);
             if (chan->buffer) {
-                // 释放通道内剩余的所有消息引用
                 for (size_t i = 0; i < chan->size; i++) {
                     size_t idx = (chan->head + i) % chan->capacity;
                     xt_release(chan->buffer[idx]);
                 }
                 free(chan->buffer);
             }
+            break;
+        }
+        case XT_TYPE_SOCKET: {
+            XTSocket* s = (XTSocket*)obj;
+            xt_net_close_obj(s);
             break;
         }
         case XT_TYPE_BYTES: {
@@ -819,33 +845,34 @@ static int xt_is_real_ptr(XTValue val) {
 /**
  * @brief 增加引用计数 (ARC Retain)
  */
+// ARC 内存序约定 (Phase 3 安全审计通过):
+//   xt_retain:  memory_order_relaxed — 仅需原子递增，无需同步其他内存操作
+//   xt_release: memory_order_seq_cst — 若 old_ref==1 将析构对象，
+//               seq_cst 保证所有线程对此对象的写在此线程可见
+//   IMMORTAL 检查: relaxed — 仅读标志位，非同步点
+
 void xt_retain(XTValue val) {
-    if (XT_IS_INT(val)) return; // P0: 极速路径，跳过标记指针
+    if (XT_IS_INT(val)) return;
     if (xt_is_real_ptr(val)) {
         xt_check_obj((void*)val);
         XTObject* obj = (XTObject*)val;
-        // 长生不老对象不参与计数逻辑，提升自举速度
-        if (atomic_load(&obj->ref_count) >= XT_REF_COUNT_IMMORTAL) return;
+        if (atomic_load_explicit(&obj->ref_count, memory_order_relaxed) >= XT_REF_COUNT_IMMORTAL) return;
         atomic_fetch_add_explicit(&obj->ref_count, 1, memory_order_relaxed);
     }
 }
 
-/**
- * @brief 减少引用计数 (ARC Release)
- */
 void xt_release(XTValue val) {
     if (XT_IS_INT(val)) return;
     if (xt_is_real_ptr(val)) {
         xt_check_obj((void*)val);
         XTObject* obj = (XTObject*)val;
-        if (atomic_load(&obj->ref_count) >= XT_REF_COUNT_IMMORTAL) return;
+        if (atomic_load_explicit(&obj->ref_count, memory_order_relaxed) >= XT_REF_COUNT_IMMORTAL) return;
 
+        // seq_cst: 若触发析构，保证所有先前内存操作全局可见
         uint32_t old_ref = atomic_fetch_sub(&obj->ref_count, 1);
         if (old_ref == 1) {
-            // 引用计数降至 0，执行析构
             xt_free_obj(obj);
         }
-        // old_ref == 0 意味着对象已被释放——不再触碰已释放内存
     }
 }
 
@@ -966,7 +993,10 @@ XTValue xt_array_get(XTValue arr_val, XTValue index_val) {
  */
 XTValue xt_array_pop(XTArray* arr) {
     if (!arr || arr->header.type_id != XT_TYPE_ARRAY || arr->length == 0) return XT_NULL;
-    return (XTValue)arr->elements[--arr->length];
+    arr->length--;
+    XTValue val = (XTValue)arr->elements[arr->length];
+    arr->elements[arr->length] = NULL; // 清除槽位，防止未来追加时覆盖导致泄漏
+    return val;
 }
 
 /**
@@ -1611,62 +1641,149 @@ void xt_bytes_append(XTValue bytes_val, uint8_t b_val) {
     b->data[b->length++] = b_val;
 }
 
-// --- 任务与通道 (并发原型) ---
+// --- 任务与通道 (v0.2: 已加互斥锁保护，对接线程池) ---
 
 XTValue xt_task_new(XTValue result) {
     XTTask* t = (XTTask*)xt_malloc(sizeof(XTTask), XT_TYPE_TASK);
     t->result = result;
     if (result != XT_NULL) xt_retain(result);
     t->status = 1;
+    t->pool_id = -1;
     return (XTValue)t;
 }
 
 XTValue xt_wait(XTValue task_val) {
-    return XT_NULL;
+    if (!xt_is_real_ptr(task_val)) return XT_NULL;
+    XTTask* t = (XTTask*)task_val;
+    return xt_async_wait(t);
+}
+
+// 线程池任务包装：调用 func_ptr(arg) 并返回结果
+typedef struct {
+    void* func_ptr;
+    XTValue arg;
+} async_ctx;
+
+static void* async_runner(void* p) {
+    async_ctx* ctx = (async_ctx*)p;
+    typedef XTValue (*xt_func)(XTValue);
+    xt_func f = (xt_func)ctx->func_ptr;
+    XTValue result = f(ctx->arg);
+    free(ctx);
+    return (void*)result;
+}
+
+XTTask* xt_async_spawn(void* func_ptr, XTValue arg) {
+    XTTask* t = (XTTask*)xt_malloc(sizeof(XTTask), XT_TYPE_TASK);
+    t->result = XT_NULL;
+    t->status = 0;  // 运行中
+    async_ctx* ctx = (async_ctx*)malloc(sizeof(async_ctx));
+    ctx->func_ptr = func_ptr;
+    ctx->arg = arg;
+    t->pool_id = xt_threadpool_submit(async_runner, ctx);
+    return t;
+}
+
+XTValue xt_async_wait(XTTask* task) {
+    if (!task || task->pool_id < 0) return task ? task->result : XT_NULL;
+    void* raw = xt_threadpool_wait(task->pool_id);
+    task->result = (XTValue)raw;
+    task->status = 1;
+    return task->result;
 }
 
 XTValue xt_channel_new(size_t capacity) {
     XTChannel* c = (XTChannel*)xt_malloc(sizeof(XTChannel), XT_TYPE_CHANNEL);
-    c->buffer = (XTValue*)malloc(capacity * sizeof(XTValue));
+    c->buffer = (XTValue*)calloc(capacity, sizeof(XTValue));
     c->size = 0; c->capacity = capacity; c->head = 0; c->tail = 0;
+    XT_CHAN_MUTEX_INIT(&c->mu);
     return (XTValue)c;
 }
 
 void xt_channel_send(XTValue chan_val, XTValue val) {
     if (XT_IS_INT(chan_val)) return;
     XTChannel* c = (XTChannel*)chan_val;
-    if (c->size >= c->capacity) return; 
+    XT_CHAN_MUTEX_LOCK(&c->mu);
+    if (c->size >= c->capacity) { XT_CHAN_MUTEX_UNLOCK(&c->mu); return; }
+    if (c->buffer[c->tail] != XT_NULL) {
+        xt_release(c->buffer[c->tail]);
+    }
     c->buffer[c->tail] = val;
     xt_retain(val);
     c->tail = (c->tail + 1) % c->capacity; c->size++;
+    XT_CHAN_MUTEX_UNLOCK(&c->mu);
 }
 
 XTValue xt_channel_receive(XTValue chan_val) {
     if (XT_IS_INT(chan_val)) return XT_NULL;
     XTChannel* c = (XTChannel*)chan_val;
-    if (c->size == 0) return XT_NULL;
+    XT_CHAN_MUTEX_LOCK(&c->mu);
+    if (c->size == 0) { XT_CHAN_MUTEX_UNLOCK(&c->mu); return XT_NULL; }
     XTValue val = c->buffer[c->head];
+    c->buffer[c->head] = XT_NULL;
     c->head = (c->head + 1) % c->capacity; c->size--;
+    XT_CHAN_MUTEX_UNLOCK(&c->mu);
     return val;
 }
 
 // --- 系统原语与网络模拟 ---
 
 XTValue xt_http_request(XTValue url_val) {
+    if (!xt_is_real_ptr(url_val)) return (XTValue)xt_result_new(0, NULL, (void*)xt_string_new("URL无效"));
     XTString* url = (XTString*)url_val;
-    char buf[512];
-    snprintf(buf, sizeof(buf), "模拟请求响应内容: 来自 %s", url->data);
-    return (XTValue)xt_result_new(1, (void*)xt_string_new(buf), NULL);
+    void* result = xt_net_http_get(url->data);
+    // xt_net_http_get 返回 char*：成功时是响应体，失败时是错误信息
+    // 用简单启发式判断：以 "不支持的" 或 "无法" 或 "HTTP" 开头的是错误
+    const char* resp = (const char*)result;
+    if (!resp) return (XTValue)xt_result_new(0, NULL, (void*)xt_string_new("请求失败"));
+    if (strncmp(resp, "不支持", 9) == 0 || strncmp(resp, "无法", 6) == 0 || strncmp(resp, "HTTP", 4) == 0 || strncmp(resp, "发送", 6) == 0) {
+        XTString* err = xt_string_new(resp);
+        free(result);
+        return (XTValue)xt_result_new(0, NULL, (void*)err);
+    }
+    XTString* body = xt_string_new(resp);
+    free(result);
+    return (XTValue)xt_result_new(1, (void*)body, NULL);
 }
 
 XTValue xt_listen(XTValue port_val, XTValue callback_val) {
     int64_t port = xt_to_int(port_val);
-    printf("[运行时] 开始模拟监听端口: %lld\n", port);
+    int rc = xt_net_listen((int)port, NULL);
+    if (rc < 0) {
+        char err[64];
+        snprintf(err, sizeof(err), "监听端口 %d 失败", (int)port);
+        return (XTValue)xt_result_new(0, NULL, (void*)xt_string_new(err));
+    }
     return (XTValue)xt_result_new(1, (void*)XT_TRUE, NULL);
 }
 
 XTValue xt_connect(XTValue addr_val) {
-    return (XTValue)xt_result_new(1, (void*)XT_TRUE, NULL);
+    if (!xt_is_real_ptr(addr_val)) return (XTValue)xt_result_new(0, NULL, (void*)xt_string_new("地址无效"));
+    XTString* addr = (XTString*)addr_val;
+
+    // 解析 host:port
+    char host[256] = {0};
+    int port = 80;
+    const char* colon = strchr(addr->data, ':');
+    if (colon) {
+        size_t hlen = (size_t)(colon - addr->data);
+        if (hlen >= sizeof(host)) hlen = sizeof(host) - 1;
+        memcpy(host, addr->data, hlen);
+        port = atoi(colon + 1);
+    } else {
+        size_t len = strlen(addr->data);
+        if (len >= sizeof(host)) len = sizeof(host) - 1;
+        memcpy(host, addr->data, len);
+    }
+    if (port <= 0) port = 80;
+
+    void* sock = xt_net_connect(host, port);
+    if (!sock) {
+        char err[256];
+        snprintf(err, sizeof(err), "无法连接到 %s", addr->data);
+        return (XTValue)xt_result_new(0, NULL, (void*)xt_string_new(err));
+    }
+    return (XTValue)xt_result_new(1, sock, NULL);
 }
 
 XTValue xt_get_temp_path() {
@@ -1852,6 +1969,8 @@ XTValue xt_math_random(XTValue max_val) {
 XTValue xt_math_abs(XTValue n_val) {
     if (XT_IS_INT(n_val)) {
         int64_t v = XT_TO_INT(n_val);
+        // INT64_MIN 的绝对值无法用 int64_t 表示，钳位到 INT64_MAX
+        if (v == INT64_MIN) return XT_FROM_INT(INT64_MAX);
         return XT_FROM_INT(v < 0 ? -v : v);
     }
     double d = xt_to_double(n_val);

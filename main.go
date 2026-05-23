@@ -210,9 +210,13 @@ func main() {
 		}
 		rtC := filepath.Join(runtimeDir, "xt_runtime.c")
 
-		renderBridgeC := filepath.Join(projectDir, "lib", "渲染桥.c")
-		raylibA := "C:/raylib/raylib/src/libraylib.a"
-		raylibInclude := "C:/raylib/raylib/src"
+		renderBridgeC := filepath.Join(projectDir, "lib", "渲染", "渲染桥.c")
+		raylibDir := os.Getenv("RAYLIB_DIR")
+		if raylibDir == "" {
+			raylibDir = "C:/raylib/raylib/src"
+		}
+		raylibA := filepath.Join(raylibDir, "libraylib.a")
+		raylibInclude := raylibDir
 		useRender := hasImport(program, "渲染") && fileExists(renderBridgeC) && fileExists(raylibA)
 
 		objFile := strings.TrimSuffix(filename, ".xt") + ".o"
@@ -243,12 +247,18 @@ func main() {
 		gccExe := "gcc"
 		// raylib 用 w64devkit 的 gcc 编译，必须用同一个工具链链接
 		if useRender {
-			w64gcc := "C:/raylib/w64devkit/bin/gcc.exe"
+			w64devkitDir := os.Getenv("W64DEVKIT_DIR")
+		if w64devkitDir == "" {
+			w64devkitDir = "C:/raylib/w64devkit"
+		}
+		w64gcc := filepath.Join(w64devkitDir, "bin", "gcc.exe")
 			if fileExists(w64gcc) {
 				gccExe = w64gcc
 			}
 		}
-		gccArgs := []string{objFile, rtC, "-o", outputName, "-lshell32"}
+		threadpoolC := filepath.Join(runtimeDir, "xt_threadpool.c")
+		netC := filepath.Join(runtimeDir, "xt_net.c")
+		gccArgs := []string{objFile, rtC, threadpoolC, netC, "-o", outputName, "-lshell32", "-lws2_32"}
 		if useRender {
 			gccArgs = append(gccArgs, bridgeObj, raylibA, "-lopengl32", "-lgdi32", "-lwinmm")
 		}

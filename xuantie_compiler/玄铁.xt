@@ -276,9 +276,30 @@
         }
     }
 
+    // 寻找线程池文件（与运行时文件同目录）
+    设 tpFile = runtimeDir & "\\xt_threadpool.c"
+    若 非 文件.存在?(tpFile) {
+        tpFile = "..\\runtime\\xt_threadpool.c"
+    }
+    若 非 文件.存在?(tpFile) {
+        // 最后尝试与 rtFile 相同的路径
+        设 tpFile = rtFile.替换("xt_runtime.c", "xt_threadpool.c").替换("xt_runtime.o", "xt_threadpool.c")
+    }
+    若 非 文件.存在?(tpFile) {
+        tpFile = ""  // 线程池文件不存在时跳过（向后兼容旧版运行时）
+    }
+    若 输出信息 且 tpFile != "" { 示("线程池文件: " & tpFile) }
+
+    // 寻找网络栈文件（与线程池同目录）
+    设 netFile = runtimeDir & "\\xt_net.c"
+    若 非 文件.存在?(netFile) { netFile = "..\\runtime\\xt_net.c" }
+    若 非 文件.存在?(netFile) { netFile = rtFile.替换("xt_runtime.c", "xt_net.c").替换("xt_runtime.o", "xt_net.c") }
+    若 非 文件.存在?(netFile) { netFile = "" }
+    若 输出信息 且 netFile != "" { 示("网络栈文件: " & netFile) }
+
     // 调用 gcc 进行链接
     若 输出信息 { 示("正在调用 MinGW 进行链接...") }
-    
+
     // 如果输出文件已存在，先尝试删除它以避免链接时的文件锁冲突导致的挂起
     若 文件.存在?(输出路径) {
         执("cmd /c del /q \"" & 输出路径 & "\" 2>nul")
@@ -286,9 +307,15 @@
 
     设 链接指令 = ""
     若 链接方式 == "静态" {
-        链接指令 = "gcc -g -static -Wl,--stack,16777216 \"" & o路径 & "\" \"" & rtFile & "\" -o \"" & 输出路径 & "\""
+        链接指令 = "gcc -g -static -Wl,--stack,16777216 \"" & o路径 & "\" \"" & rtFile & "\""
+        若 tpFile != "" { 链接指令 = 链接指令 & " \"" & tpFile & "\"" }
+        若 netFile != "" { 链接指令 = 链接指令 & " \"" & netFile & "\"" }
+        链接指令 = 链接指令 & " -lws2_32 -o \"" & 输出路径 & "\""
     } 否 {
-        链接指令 = "gcc -g -Wl,--stack,16777216 \"" & o路径 & "\" \"" & rtFile & "\" -o \"" & 输出路径 & "\""
+        链接指令 = "gcc -g -Wl,--stack,16777216 \"" & o路径 & "\" \"" & rtFile & "\""
+        若 tpFile != "" { 链接指令 = 链接指令 & " \"" & tpFile & "\"" }
+        若 netFile != "" { 链接指令 = 链接指令 & " \"" & netFile & "\"" }
+        链接指令 = 链接指令 & " -lws2_32 -o \"" & 输出路径 & "\""
     }
     
     设 gcc结果 = 执(链接指令)
