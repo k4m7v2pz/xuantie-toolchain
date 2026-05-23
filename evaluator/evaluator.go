@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -403,10 +404,62 @@ func evalDictLiteralContext(dl *ast.DictLiteral, env map[string]object.Object, i
 	return dict
 }
 
+func isBarePackageNameEval(path string) bool {
+	if len(path) == 0 || path[0] == '.' {
+		return false
+	}
+	for _, c := range path {
+		if c == '\\' || c == '/' || c == ':' || c == '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func getTiePMInstallDirEval() string {
+	if dir := os.Getenv("TIEPM_HOME"); dir != "" {
+		return filepath.Join(dir, "已安装")
+	}
+	userProfile := os.Getenv("USERPROFILE")
+	return filepath.Join(userProfile, ".tiepm", "已安装")
+}
+
+func resolveTiePMPackagePathEval(pkgName string) string {
+	installDir := getTiePMInstallDirEval()
+
+	candidate1 := filepath.Join(installDir, pkgName, pkgName+".xt")
+	if _, err := os.Stat(candidate1); err == nil {
+		return candidate1
+	}
+
+	pkgDir := filepath.Join(installDir, pkgName)
+	entries, err := ioutil.ReadDir(pkgDir)
+	if err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				candidate2 := filepath.Join(pkgDir, entry.Name(), pkgName+".xt")
+				if _, err := os.Stat(candidate2); err == nil {
+					return candidate2
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
 func evalImportExpression(ie *ast.ImportExpression, env map[string]object.Object, isAssignment bool) object.Object {
 	path := ie.Path
-	// 如果是相对路径，且环境中有当前目录信息，则进行路径拼接
-	if !filepath.IsAbs(path) {
+
+	// 铁铺裸包名检测
+	if isBarePackageNameEval(path) {
+		tiepmPath := resolveTiePMPackagePathEval(path)
+		if tiepmPath != "" {
+			path = tiepmPath
+		} else {
+			return newError(ie.GetLine(), "无法解析铁铺包引用 '%s'——请先执行 '铁铺 安装 %s'", path, path)
+		}
+	} else if !filepath.IsAbs(path) {
 		if baseDirObj, ok := env["__DIR__"]; ok {
 			if baseDir, ok := baseDirObj.(*object.String); ok {
 				path = filepath.Join(baseDir.Value, path)
@@ -1106,8 +1159,8 @@ func evalAsyncExpression(ae *ast.AsyncExpression, env map[string]object.Object) 
 		Channel: make(chan object.Object, 1),
 	}
 
-	// 捕获当前环境变量（简单复制，实际上可能需要更复杂的闭包处理）
-	asyncEnv := extendEnv(env)
+	// 深拷贝环境——消除与主 goroutine 的 map 并发读写数据竞争
+	asyncEnv := cloneEnv(env)
 
 	go func() {
 		result := evalBlock(ae.Block, asyncEnv)
@@ -1124,7 +1177,8 @@ func evalParallelExpression(pe *ast.ParallelExpression, env map[string]object.Ob
 
 	for i, block := range pe.Blocks {
 		channels[i] = make(chan object.Object, 1)
-		parallelEnv := extendEnv(env)
+		// 每个 goroutine 获得独立的 env 快照——消除并发 map 读写数据竞争
+		parallelEnv := cloneEnv(env)
 		go func(ch chan object.Object, b []ast.Statement, e map[string]object.Object) {
 			ch <- evalBlock(b, e)
 			close(ch)
@@ -2225,6 +2279,23 @@ func extendEnv(outer map[string]object.Object) map[string]object.Object {
 	// 我们不拷贝，而是通过特殊的键记录父环境，实现作用域链
 	env["__PARENT_ENV__"] = &object.InternalEnv{Value: outer}
 	return env
+}
+
+// cloneEnv 深拷贝环境 map，消除并发共享——goroutine 获得独立的快照
+// 注意：env 中的对象（Array/Dict/Instance）仍然是共享引用，
+// 用户代码应避免在异步/并行块中修改共享可变对象
+func cloneEnv(env map[string]object.Object) map[string]object.Object {
+	cloned := make(map[string]object.Object, len(env))
+	for k, v := range env {
+		if k == "__PARENT_ENV__" {
+			if pEnv, ok := v.(*object.InternalEnv); ok {
+				cloned["__PARENT_ENV__"] = &object.InternalEnv{Value: cloneEnv(pEnv.Value)}
+			}
+		} else {
+			cloned[k] = v
+		}
+	}
+	return cloned
 }
 
 func lookupEnv(env map[string]object.Object, name string) (object.Object, bool) {

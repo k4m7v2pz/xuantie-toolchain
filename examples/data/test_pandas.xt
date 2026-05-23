@@ -1,5 +1,5 @@
 // test_pandas.xt
-引 "tiedata.xt"
+引 "./tiedata.xt"
 
 示("=== 玄铁 '铁数' (TieData) 类 Pandas 演示 ===")
 
@@ -13,6 +13,7 @@
 // 2. 初始化数据帧
 设 df = 创建数据帧()
 df.从文本(原始文本)
+
 
 // 3. 展示数据
 df.展示(5)

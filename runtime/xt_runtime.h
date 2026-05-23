@@ -56,6 +56,11 @@ typedef uintptr_t XTValue;
 #define XT_IS_INT(v)    (((v) & XT_TAG_MASK) == XT_TAG_INT)
 #define XT_IS_PTR(v)    (!XT_IS_INT(v))
 
+// 真实堆指针检测——排除 XT_FALSE(0x2)、XT_TRUE(0x4)、XT_NULL(0x0) 等小常量
+// 这些小值 LSB=0 被 XT_IS_PTR 误判为指针，解引用会造成段错误
+// 现代 OS 上合法堆地址始终 > 4096 (0x1000)
+#define XT_IS_REAL_PTR(v)  (!XT_IS_INT(v) && (v) > 4096)
+
 /// 将 C 整数转换为标记后的 XTValue
 #define XT_FROM_INT(i)  (((XTValue)(i) << 1) | XT_TAG_INT)
 /// 从标记后的 XTValue 提取原始整数
@@ -173,9 +178,10 @@ typedef struct {
  */
 typedef struct {
     XTObject header;
-    void** elements; ///< 元素数组 (存储 XTValue)
-    size_t length;   ///< 当前元素个数
-    size_t capacity; ///< 数组容量
+    void** elements;          ///< 元素数组 (存储 XTValue)
+    size_t length;            ///< 当前元素个数
+    size_t capacity;          ///< 数组容量
+    uint8_t elements_in_arena; ///< 标志位：elements 是否由 Arena 分配 (不可 free/realloc)
 } XTArray;
 
 /**

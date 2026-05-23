@@ -32,7 +32,8 @@ type ClassInfo struct {
 type LLVMCompiler struct {
 	program         *ast.Program
 	output          bytes.Buffer
-	allocaOutput    bytes.Buffer // 存储当前函数的所有 alloca
+	allocaOutput    bytes.Buffer   // 存储当前函数的所有 alloca
+	allocaSet       map[string]bool // 去重：已入口 alloca 的寄存器名
 	funcOutput      bytes.Buffer
 	globalOutput    bytes.Buffer // 存储全局变量定义的 IR
 	regCount        int
@@ -52,7 +53,13 @@ type LLVMCompiler struct {
 	visitedImports  map[string]bool
 	moduleAliases   map[string]bool
 	declaredGlobals map[string]bool
-	funcReturnTypes map[string]string // 函数名 → 内部返回类型（"raw_i64"/"double"/"i1"），用于调用处自动脱壳
+	errors         []string       // 编译错误列表，进入 LLVM/clang 前必须检查
+	funcReturnTypes map[string]string // 函数名 → 内部返回类型
+}
+
+func (c *LLVMCompiler) Errors() []string { return c.errors }
+func (c *LLVMCompiler) addError(format string, args ...interface{}) {
+	c.errors = append(c.errors, fmt.Sprintf(format, args...))
 }
 
 func NewLLVMCompiler(program *ast.Program) *LLVMCompiler {
@@ -66,6 +73,7 @@ func NewLLVMCompiler(program *ast.Program) *LLVMCompiler {
 		moduleAliases:   make(map[string]bool),
 		declaredGlobals: make(map[string]bool),
 		arenaPoolRegs:   make(map[string]bool),
+		allocaSet:       make(map[string]bool),
 		funcReturnTypes: make(map[string]string),
 	}
 
@@ -269,13 +277,18 @@ func (c *LLVMCompiler) emit(format string, args ...interface{}) {
 
 func (c *LLVMCompiler) emitAlloca(format string, args ...interface{}) {
 	line := fmt.Sprintf(format, args...)
-	c.allocaOutput.WriteString("  " + line + "\n")
-	// Also init with 0 for GC
 	if len(args) > 0 {
 		if reg, ok := args[0].(string); ok {
+			if c.allocaSet[reg] {
+				return
+			}
+			c.allocaSet[reg] = true
+			c.allocaOutput.WriteString("  " + line + "\n")
 			c.allocaOutput.WriteString(fmt.Sprintf("  store i64 0, i64* %s\n", reg))
+			return
 		}
 	}
+	c.allocaOutput.WriteString("  " + line + "\n")
 }
 
 func (c *LLVMCompiler) isScalarType(typ string) bool {
@@ -863,6 +876,7 @@ func (c *LLVMCompiler) compileFunctionStatement(s *ast.FunctionStatement) {
 	c.output = bytes.Buffer{}
 	oldAllocaOutput := c.allocaOutput
 	c.allocaOutput = bytes.Buffer{}
+	c.allocaSet = make(map[string]bool)
 	oldFunc := c.currentFunc
 	c.currentFunc = s.Name.Value
 	oldTable := make(map[string]SymbolInfo)
@@ -943,26 +957,40 @@ func (c *LLVMCompiler) compileExpression(expr ast.Expression) (string, string, s
 		return "2", "i64", ""
 	case *ast.ImportExpression:
 		importPath := e.Path
-		if !filepath.IsAbs(importPath) {
+
+		// 铁铺裸包名检测：如 引 "数组工具" -> 自动解析到 ~/.tiepm/已安装/
+		if isBarePackageName(importPath) {
+			tiepmPath := resolveTiePMPackagePath(importPath)
+			if tiepmPath != "" {
+				importPath = tiepmPath
+			} else {
+				c.addError("[行:%d] 无法解析铁铺包引用 '%s'——请先执行 '铁铺 安装 %s'",
+					e.GetLine(), importPath, importPath)
+				c.addError("  如果已安装，请检查 %s\\%s 目录", getTiePMInstallDir(), importPath)
+				return "0", "i64", ""
+			}
+		} else if !filepath.IsAbs(importPath) {
 			dir := filepath.Dir(c.filePath)
 			importPath = filepath.Join(dir, importPath)
 		}
 		absPath, _ := filepath.Abs(importPath)
+		if e.Alias != nil {
+			c.moduleAliases[e.Alias.Value] = true
+		}
 		if c.visitedImports[absPath] {
 			return "0", "i64", ""
 		}
 		c.visitedImports[absPath] = true
 		data, err := ioutil.ReadFile(absPath)
 		if err != nil {
+			c.addError("[行:%d] 无法读取引入模块: %s", e.GetLine(), absPath)
+			c.addError("  原始路径: %s (提示: 检查路径或执行 '铁铺 安装 <包名>')", e.Path)
 			return "0", "i64", ""
 		}
 		l := lexer.New(string(data))
 		p := parser.New(l)
 		importProgram := p.ParseProgram()
 		importProgram.FilePath = absPath
-		if e.Alias != nil {
-			c.moduleAliases[e.Alias.Value] = true
-		}
 		oldPath := c.filePath
 		c.filePath = absPath
 		for _, stmt := range importProgram.Statements {
@@ -1029,11 +1057,17 @@ func (c *LLVMCompiler) compileExpression(expr ast.Expression) (string, string, s
 		case "道":
 			return "23", "i64", "" // 11 * 2 + 1 = 23
 		}
-		reg := c.nextReg()
-		ptrReg := c.nextReg()
-		c.emit("  %s = bitcast i64 (...)* @\"%s\" to i8*", ptrReg, e.Value)
-		c.emit("  %s = ptrtoint i8* %s to i64", reg, ptrReg)
-		return reg, "i64", ""
+		// 尝试以 @"name" 格式查找（外部函数 `外 函` 注册为 @"funcname"）
+		if info, ok := c.symbolTable["@\""+e.Value+"\""]; ok && info.IsGlobal {
+			reg := c.nextReg()
+			ptrReg := c.nextReg()
+			c.emit("  %s = bitcast i64 (...)* %s to i8*", ptrReg, info.AddrReg)
+			c.emit("  %s = ptrtoint i8* %s to i64", reg, ptrReg)
+			return reg, "i64", ""
+		}
+		// 标识符不在符号表中，也不是类型关键字——编译期报错
+		c.addError("[行:%d] 未定义的标识符 '%s'", e.GetLine(), e.Value)
+		return "0", "i64", ""
 	case *ast.PostfixExpression:
 		if e.Operator == "?" {
 			// 目前对 x? 的简单支持：如果它是个 Result 对象，我们可能需要检查它是否成功，
@@ -1184,11 +1218,19 @@ func (c *LLVMCompiler) compileExpression(expr ast.Expression) (string, string, s
 		}
 
 		reg := c.nextReg()
+		isVoidCall := declaredRetType == "void"
+		callFmt := "  %s = call %s %s(%s)"
+		if isVoidCall {
+			callFmt = "  call void %s(%s)"
+		}
 		if !strings.HasPrefix(funcName, "@") {
 			funcName = "@" + funcName
 		}
 
-		if strings.HasPrefix(funcName, "@%") {
+		if isVoidCall {
+			// void 函数调用不分配结果寄存器
+			c.emit("  call void %s(%s)", funcName, strings.Join(args, ", "))
+		} else if strings.HasPrefix(funcName, "@%") {
 			funcName = strings.TrimPrefix(funcName, "@")
 			funcPtrReg := c.nextReg()
 			argTypes := make([]string, len(args))
@@ -1196,7 +1238,7 @@ func (c *LLVMCompiler) compileExpression(expr ast.Expression) (string, string, s
 				argTypes[i] = strings.Split(a, " ")[0]
 			}
 			c.emit("  %s = inttoptr i64 %s to %s (%s)*", funcPtrReg, funcName, declaredRetType, strings.Join(argTypes, ", "))
-			c.emit("  %s = call %s %s(%s)", reg, declaredRetType, funcPtrReg, strings.Join(args, ", "))
+			c.emit(callFmt, reg, declaredRetType, funcPtrReg, strings.Join(args, ", "))
 		} else if strings.HasPrefix(funcName, "%") {
 			funcPtrReg := c.nextReg()
 			argTypes := make([]string, len(args))
@@ -1204,16 +1246,20 @@ func (c *LLVMCompiler) compileExpression(expr ast.Expression) (string, string, s
 				argTypes[i] = strings.Split(a, " ")[0]
 			}
 			c.emit("  %s = inttoptr i64 %s to %s (%s)*", funcPtrReg, funcName, declaredRetType, strings.Join(argTypes, ", "))
-			c.emit("  %s = call %s %s(%s)", reg, declaredRetType, funcPtrReg, strings.Join(args, ", "))
+			c.emit(callFmt, reg, declaredRetType, funcPtrReg, strings.Join(args, ", "))
 		} else {
 			if strings.Contains(funcName, "xt_to_int") {
 				c.emit("  %s = call i64 %s(%s)", reg, funcName, strings.Join(args, ", "))
 			} else {
-				c.emit("  %s = call %s %s(%s)", reg, declaredRetType, funcName, strings.Join(args, ", "))
+				c.emit(callFmt, reg, declaredRetType, funcName, strings.Join(args, ", "))
 			}
 		}
 		for _, argReg := range argRegs {
 			c.emit("  call void @xt_release(i64 %s)", argReg)
+		}
+		// void 函数不需要返回值
+		if isVoidCall {
+			return "0", "i64", ""
 		}
 		// 如果函数有返回类型注解（如"整"），自动脱壳为 raw_i64
 		if rawFuncName != "" {
@@ -1277,7 +1323,11 @@ func (c *LLVMCompiler) compileExpression(expr ast.Expression) (string, string, s
 
 				fRawReg := c.nextReg()
 
-				argCount := classInfo.MethodArgsCount[methodName]
+				argCount, hasCount := classInfo.MethodArgsCount[methodName]
+				if !hasCount {
+					c.addError("[行:%d] 方法 '%s' 的参数计数缺失", e.GetLine(), methodName)
+					return "0", "i64", ""
+				}
 				sig := "i64 (i64"
 				for i := 0; i < argCount; i++ {
 					sig += ", i64"
@@ -2779,6 +2829,7 @@ func (c *LLVMCompiler) compileMethodStatement(className string, s *ast.FunctionS
 	c.output = bytes.Buffer{}
 	oldAllocaOutput := c.allocaOutput
 	c.allocaOutput = bytes.Buffer{}
+	c.allocaSet = make(map[string]bool)
 	oldFunc := c.currentFunc
 	c.currentFunc = s.Name.Value
 	oldTable := make(map[string]SymbolInfo)

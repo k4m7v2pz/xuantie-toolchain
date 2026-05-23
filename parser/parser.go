@@ -306,6 +306,11 @@ func (p *Parser) parseMemberStatement() ast.Statement {
 		p.nextToken()
 	}
 
+	if p.cur.Type == token.TOKEN_CONST {
+		// "常" 本身已是 parseVarStatement 处理的合法开头，
+		// 不消费，让 parseVarStatement 自己读变量名
+	}
+
 	if p.cur.Type == token.TOKEN_FUNCTION {
 		return p.parseFunctionStatement(visibility, isOverride)
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strings"
 	"xuantie/ast"
@@ -1283,9 +1284,63 @@ func (c *GoCompiler) memberCallExpressionCode(e *ast.MemberCallExpression, isAss
 	return fmt.Sprintf("getAttr(%s, %q)", c.expressionCode(e.Object, isAssignment), e.Member.Value)
 }
 
+func isBarePackageName(path string) bool {
+	if len(path) == 0 || path[0] == '.' {
+		return false
+	}
+	for _, c := range path {
+		if c == '\\' || c == '/' || c == ':' || c == '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func getTiePMInstallDir() string {
+	if dir := os.Getenv("TIEPM_HOME"); dir != "" {
+		return filepath.Join(dir, "已安装")
+	}
+	userProfile := os.Getenv("USERPROFILE")
+	return filepath.Join(userProfile, ".tiepm", "已安装")
+}
+
+func resolveTiePMPackagePath(pkgName string) string {
+	installDir := getTiePMInstallDir()
+
+	// 方案1: <包名>.xt 直接在安装目录下
+	candidate1 := filepath.Join(installDir, pkgName, pkgName+".xt")
+	if _, err := os.Stat(candidate1); err == nil {
+		return candidate1
+	}
+
+	// 方案2: 深入一层子目录（GitHub archive 格式: <名>-<版本>/）
+	pkgDir := filepath.Join(installDir, pkgName)
+	entries, err := ioutil.ReadDir(pkgDir)
+	if err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				candidate2 := filepath.Join(pkgDir, entry.Name(), pkgName+".xt")
+				if _, err := os.Stat(candidate2); err == nil {
+					return candidate2
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
 func (c *GoCompiler) importExpressionCode(e *ast.ImportExpression, isAssignment bool) string {
 	path := e.Path
-	if !filepath.IsAbs(path) && c.program.FilePath != "" {
+	if isBarePackageName(path) {
+		tiepmPath := resolveTiePMPackagePath(path)
+		if tiepmPath != "" {
+			path = tiepmPath
+		} else {
+			c.errors = append(c.errors, fmt.Sprintf("[行:%d] 无法解析铁铺包引用 '%s'——请先执行 '铁铺 安装 %s'", e.GetLine(), path, path))
+			return "nil"
+		}
+	} else if !filepath.IsAbs(path) && c.program.FilePath != "" {
 		path = filepath.Join(filepath.Dir(c.program.FilePath), path)
 	}
 	absPath, err := filepath.Abs(path)
