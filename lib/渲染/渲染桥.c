@@ -24,20 +24,23 @@
 #define XT_FROM_BOOL(b) ((b) ? XT_TRUE : XT_FALSE)
 #define XT_TO_BOOL(v)   ((v) == XT_TRUE)
 
-// XTString 结构 (与 xt_runtime.h 对齐)
+// XTString 结构 (与 xt_runtime.h/c 对齐)
+// 运行时 XTString: { XTObject(12字节) + 填充(4) + char* data(8) + size_t length(8) + uint8_t(1) }
 typedef struct {
     uint32_t magic;
-    int32_t  ref_count;
-    int32_t  type_id;
-    int32_t  length;
-    char     data[];
+    uint32_t ref_count;
+    uint32_t type_id;
+    char*    data;
+    size_t   length;
+    uint8_t  data_in_arena;
 } XTString;
 
-// XTFloat 结构 (与 xt_runtime.h 对齐)
+// XTFloat 结构 (与 xt_runtime.h/c 对齐)
+// 运行时: { XTObject(12字节) + 填充(4) + double value(8) } = 24字节
 typedef struct {
     uint32_t magic;
-    int32_t  ref_count;
-    int32_t  type_id;
+    uint32_t ref_count;
+    uint32_t type_id;
     double   value;
 } XTFloat;
 
@@ -66,17 +69,12 @@ static double xt_get_float(uintptr_t v) {
     return 0.0;
 }
 
-// 创建浮点数 XTValue (返回 i64 兼容值)
-// 简化实现：将 double 的位模式直接返回
-// 调用者通过 外 声明 float 类型来让编译器正确处理
-// 注意：这需要编译器支持，目前我们用简化方案
+// 创建浮点数 XTValue，ref_count=1 纳入正常 ARC 管理
 static uintptr_t xt_make_float(double v) {
-    // 在栈上创建一个临时 XTFloat 结构并返回其指针
-    // 警告：仅用于立即返回值场景
-    // 正确做法：分配 XTFloat 对象并注册到 GC
-    XTFloat* f = (XTFloat*)calloc(1, sizeof(XTFloat));
+    XTFloat* f = (XTFloat*)malloc(sizeof(XTFloat));
+    if (!f) return 0;
     f->magic = 0x58544F42;
-    f->ref_count = 0x7FFFFFFF; // IMMORTAL
+    f->ref_count = 1;
     f->type_id = 2;
     f->value = v;
     return (uintptr_t)f;
@@ -84,6 +82,18 @@ static uintptr_t xt_make_float(double v) {
 
 // === raylib 头 ===
 #include "raylib.h"
+
+// Win32 Unicode API 前向声明（避免包含 <windows.h> 与 raylib 冲突）
+#ifndef WINAPI
+#define WINAPI __stdcall
+#endif
+typedef void* HANDLE;
+typedef HANDLE HWND;
+typedef unsigned short wchar_t;
+extern __declspec(dllimport) int WINAPI MultiByteToWideChar(
+    unsigned int CodePage, unsigned long dwFlags, const char* lpMultiByteStr,
+    int cbMultiByte, wchar_t* lpWideCharStr, int cchWideChar);
+extern __declspec(dllimport) int WINAPI SetWindowTextW(HWND hWnd, const wchar_t* lpString);
 
 // ============================================================
 // 窗口管理
@@ -94,7 +104,7 @@ void XT_InitWindow(uintptr_t w, uintptr_t h, uintptr_t title) {
 }
 
 uintptr_t XT_WindowShouldClose(void) {
-    return XT_FROM_BOOL(WindowShouldClose());
+    return WindowShouldClose() ? 1 : 0;
 }
 
 void XT_CloseWindow(void) {
@@ -102,7 +112,7 @@ void XT_CloseWindow(void) {
 }
 
 uintptr_t XT_IsWindowReady(void) {
-    return XT_FROM_BOOL(IsWindowReady());
+    return IsWindowReady() ? 1 : 0;
 }
 
 void XT_SetTargetFPS(uintptr_t fps) {
@@ -126,7 +136,18 @@ uintptr_t XT_GetScreenHeight(void) {
 }
 
 void XT_SetWindowTitle(uintptr_t title) {
-    SetWindowTitle(xt_get_cstr(title));
+    const char* utf8 = xt_get_cstr(title);
+    // 通过 Win32 宽字符 API 正确设置 Unicode 窗口标题
+    int wideLen = MultiByteToWideChar(65001 /*CP_UTF8*/, 0, utf8, -1, NULL, 0);
+    if (wideLen > 0) {
+        wchar_t* wideTitle = (wchar_t*)malloc((size_t)wideLen * sizeof(wchar_t));
+        if (wideTitle) {
+            MultiByteToWideChar(65001, 0, utf8, -1, wideTitle, wideLen);
+            HWND hwnd = (HWND)GetWindowHandle();
+            if (hwnd) SetWindowTextW(hwnd, wideTitle);
+            free(wideTitle);
+        }
+    }
 }
 
 // ============================================================
@@ -302,11 +323,11 @@ void XT_DrawTextureEx(uintptr_t texPtr, uintptr_t x, uintptr_t y, uintptr_t rota
 // ============================================================
 
 uintptr_t XT_IsKeyDown(uintptr_t key) {
-    return XT_FROM_BOOL(IsKeyDown((int)XT_TO_INT(key)));
+    return IsKeyDown((int)XT_TO_INT(key)) ? 1 : 0;
 }
 
 uintptr_t XT_IsKeyPressed(uintptr_t key) {
-    return XT_FROM_BOOL(IsKeyPressed((int)XT_TO_INT(key)));
+    return IsKeyPressed((int)XT_TO_INT(key)) ? 1 : 0;
 }
 
 uintptr_t XT_GetKeyPressed(void) {
@@ -314,11 +335,11 @@ uintptr_t XT_GetKeyPressed(void) {
 }
 
 uintptr_t XT_IsMouseButtonDown(uintptr_t button) {
-    return XT_FROM_BOOL(IsMouseButtonDown((int)XT_TO_INT(button)));
+    return IsMouseButtonDown((int)XT_TO_INT(button)) ? 1 : 0;
 }
 
 uintptr_t XT_IsMouseButtonPressed(uintptr_t button) {
-    return XT_FROM_BOOL(IsMouseButtonPressed((int)XT_TO_INT(button)));
+    return IsMouseButtonPressed((int)XT_TO_INT(button)) ? 1 : 0;
 }
 
 uintptr_t XT_GetMouseX(void) {
@@ -415,5 +436,62 @@ void XT_UnloadMusicStream(uintptr_t musicPtr) {
     if (IS_PTR(musicPtr) && musicPtr != 0) {
         UnloadMusicStream(*(Music*)musicPtr);
         free((void*)musicPtr);
+    }
+}
+
+// ============================================================
+// 字体 —— 支持自定义 TTF/OTC 字形
+// 使用静态数组存储，返回整数索引（标记为 XT 整数）避免被 GC 误判
+// ============================================================
+
+static Font xt_font_pool[8];
+static int  xt_font_count = 0;
+
+// 辅助：从 XT 值提取 Font 指针
+static Font* xt_get_font(uintptr_t fontVal) {
+    if (!IS_INT(fontVal)) return NULL;
+    int64_t idx = XT_TO_INT(fontVal);
+    if (idx < 1 || idx > xt_font_count) return NULL;
+    return &xt_font_pool[idx - 1];
+}
+
+// 返回整数句柄（1-8），失败返回 0
+uintptr_t XT_LoadFont(uintptr_t filename, uintptr_t fontSize) {
+    if (xt_font_count >= 8) return XT_FROM_INT(0);
+
+    int cpCount = 352;  // 码点 32–383
+    int* codepoints = (int*)malloc((size_t)cpCount * sizeof(int));
+    if (!codepoints) return XT_FROM_INT(0);
+    for (int i = 0; i < cpCount; i++) codepoints[i] = 32 + i;
+
+    Font f = LoadFontEx(xt_get_cstr(filename), (int)XT_TO_INT(fontSize), codepoints, cpCount);
+    free(codepoints);
+    if (f.glyphCount == 0) f = GetFontDefault();
+
+    xt_font_pool[xt_font_count] = f;
+    xt_font_count++;
+    return XT_FROM_INT(xt_font_count);  // 返回 1-based 整数索引
+}
+
+void XT_UnloadFont(uintptr_t fontHandle) {
+    Font* p = xt_get_font(fontHandle);
+    if (p) {
+        // 避免卸载 raylib 默认字体（baseSize 为默认字体的标记）
+        if (p->glyphCount > 0 && p->texture.id != GetFontDefault().texture.id) {
+            UnloadFont(*p);
+        }
+    }
+}
+
+void XT_DrawTextEx(uintptr_t fontHandle, uintptr_t text, uintptr_t x, uintptr_t y,
+                   uintptr_t fontSize, uintptr_t spacing,
+                   uintptr_t r, uintptr_t g, uintptr_t b, uintptr_t a) {
+    Font* p = xt_get_font(fontHandle);
+    if (p) {
+        Color c = {(unsigned char)XT_TO_INT(r), (unsigned char)XT_TO_INT(g),
+                   (unsigned char)XT_TO_INT(b), (unsigned char)XT_TO_INT(a)};
+        Vector2 pos = {(float)XT_TO_INT(x), (float)XT_TO_INT(y)};
+        DrawTextEx(*p, xt_get_cstr(text), pos, (float)XT_TO_INT(fontSize),
+                   (float)XT_TO_INT(spacing), c);
     }
 }

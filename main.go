@@ -245,16 +245,10 @@ func main() {
 		}
 
 		gccExe := "gcc"
-		// raylib 用 w64devkit 的 gcc 编译，必须用同一个工具链链接
-		if useRender {
-			w64devkitDir := os.Getenv("W64DEVKIT_DIR")
-		if w64devkitDir == "" {
-			w64devkitDir = "C:/raylib/w64devkit"
-		}
-		w64gcc := filepath.Join(w64devkitDir, "bin", "gcc.exe")
-			if fileExists(w64gcc) {
-				gccExe = w64gcc
-			}
+		// 优先用 TDM-GCC（w64devkit GCC 15.2.0 在此系统上产生无效 exe）
+		tdmGcc := "C:/TDM-GCC-64/bin/gcc.exe"
+		if fileExists(tdmGcc) {
+			gccExe = tdmGcc
 		}
 		threadpoolC := filepath.Join(runtimeDir, "xt_threadpool.c")
 		netC := filepath.Join(runtimeDir, "xt_net.c")

@@ -54,6 +54,11 @@
 外 函 XT_MeasureText(text: 字, fontSize: 整): 整
 外 函 XT_DrawFPS(x: 整, y: 整): 空
 
+// === 字体（支持中文） ===
+外 函 XT_LoadFont(filename: 字, fontSize: 整): 整
+外 函 XT_UnloadFont(fontPtr: 整): 空
+外 函 XT_DrawTextEx(fontPtr: 整, text: 字, x: 整, y: 整, fontSize: 整, spacing: 整, r: 整, g: 整, b: 整, a: 整): 空
+
 // ============================================================
 // 纹理与图像
 // ============================================================
@@ -160,6 +165,11 @@
     XT_DrawCircleLines(cx, cy, 半径, r, g, b, a)
 }
 
+// 绘制实心椭圆
+公 函 绘椭圆(cx, cy, 水平半径, 垂直半径, r, g, b, a) {
+    XT_DrawEllipse(cx, cy, 水平半径, 垂直半径, r, g, b, a)
+}
+
 // 绘制文字
 公 函 绘文字(文本, x, y, 字号, r, g, b, a) {
     XT_DrawText(文本, x, y, 字号, r, g, b, a)
@@ -173,6 +183,21 @@
 // 绘制 FPS
 公 函 绘帧率(x, y) {
     XT_DrawFPS(x, y)
+}
+
+// 加载字体（支持中文，需指定系统字体路径）
+公 函 加载字体(文件, 字号) {
+    返 XT_LoadFont(文件, 字号)
+}
+
+// 释放字体
+公 函 释字体(字体句柄) {
+    XT_UnloadFont(字体句柄)
+}
+
+// 用指定字体绘制文字（支持中文）
+公 函 绘字体文字(字体句柄, 文本, x, y, 字号, 间距, r, g, b, a) {
+    XT_DrawTextEx(字体句柄, 文本, x, y, 字号, 间距, r, g, b, a)
 }
 
 // 加载纹理
