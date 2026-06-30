@@ -1,0 +1,21 @@
+# Rust / cargo
+cli/target/
+**/*.rs.bk
+
+# Go
+*.test
+*.out
+
+# 玄铁工具链产物
+dist/
+*.ll
+*.o
+tiepm_modules/
+xuantie.lock
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

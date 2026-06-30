@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"xuantie/ast"
 	"xuantie/compiler"
 	"xuantie/evaluator"
@@ -26,24 +25,10 @@ const (
 )
 
 func enableVirtualTerminalProcessing() {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	const enableVirtualTerminalProcessingMode = 0x0004
-	var (
-		handle syscall.Handle
-		mode   uint32
-	)
-	handle = syscall.Handle(os.Stdout.Fd())
-	if err := syscall.GetConsoleMode(handle, &mode); err == nil {
-		mode |= enableVirtualTerminalProcessingMode
-		syscall.Syscall(syscall.NewLazyDLL("kernel32.dll").NewProc("SetConsoleMode").Addr(), 2, uintptr(handle), uintptr(mode), 0)
-	}
-	handle = syscall.Handle(os.Stderr.Fd())
-	if err := syscall.GetConsoleMode(handle, &mode); err == nil {
-		mode |= enableVirtualTerminalProcessingMode
-		syscall.Syscall(syscall.NewLazyDLL("kernel32.dll").NewProc("SetConsoleMode").Addr(), 2, uintptr(handle), uintptr(mode), 0)
-	}
+	// 实际实现按平台分流:
+	//   enableVirtualTerminalProcessing_windows.go (windows)
+	//   enableVirtualTerminalProcessing_other.go     (非 windows 空实现)
+	enableVirtualTerminalProcessingImpl()
 }
 
 func isPowerShell() bool {
@@ -53,14 +38,15 @@ func isPowerShell() bool {
 func printHelp() {
 	fmt.Println("用法:")
 	fmt.Println("  xuantie <源文件>          解释执行脚本")
-	fmt.Println("  xuantie zao <源文件>      编译为独立可执行文件 (或用 build/造)")
+	fmt.Println("  xuantie build <源文件>    编译为独立可执行文件 (或用 zao/造)")
 	fmt.Println("  xuantie tie <源文件>      使用 LLVM 编译为原生二进制文件 (里程碑特性)")
 	fmt.Println("")
 	fmt.Println("选项:")
-	fmt.Println("  --pt <os>      目标操作系统 (windows, linux, darwin)")
-	fmt.Println("  --jg <arch>    目标指令集架构 (amd64, arm64, 386)")
-	fmt.Println("  -V, --version  打印版本号")
-	fmt.Println("  -h, --help, -? 打印此帮助信息")
+	fmt.Println("  --out <路径>    指定产物输出路径 (build/tie 子命令)")
+	fmt.Println("  --pt <os>       目标操作系统 (windows, linux, darwin)")
+	fmt.Println("  --jg <arch>     目标指令集架构 (amd64, arm64, 386)")
+	fmt.Println("  -V, --version   打印版本号")
+	fmt.Println("  -h, --help, -?  打印此帮助信息")
 }
 
 func fileExists(path string) bool {
@@ -95,6 +81,7 @@ func main() {
 	filename := ""
 	targetOS := ""
 	targetArch := ""
+	outputPath := "" // --out/-o:由工具链 wrapper 指定产物路径,空则用默认名
 
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
@@ -111,6 +98,11 @@ func main() {
 		case "--架构", "--jg":
 			if i+1 < len(os.Args) {
 				targetArch = os.Args[i+1]
+				i++
+			}
+		case "--out", "-o":
+			if i+1 < len(os.Args) {
+				outputPath = os.Args[i+1]
 				i++
 			}
 		case "-V", "--version":
@@ -243,6 +235,10 @@ func main() {
 		if runtime.GOOS == "windows" {
 			outputName += ".exe"
 		}
+		// 工具链 wrapper 通过 --out 指定产物完整路径
+		if outputPath != "" {
+			outputName = outputPath
+		}
 
 		gccExe := "gcc"
 		// 优先用 TDM-GCC（w64devkit GCC 15.2.0 在此系统上产生无效 exe）
@@ -311,6 +307,10 @@ func main() {
 		}
 		if actualOS == "windows" {
 			outputName += ".exe"
+		}
+		// 工具链 wrapper 通过 --out 指定产物完整路径
+		if outputPath != "" {
+			outputName = outputPath
 		}
 
 		fmt.Printf("正在编译 %s -> %s (平台: %s, 架构: %s) ...\n", filename, outputName, actualOS, targetArch)

@@ -1,5 +1,9 @@
 # 玄铁 (XuanTie)
 
+> **本仓库是工具链 fork**:在原玄铁语言实现基础上新增了 cargo/uv 风格的命令行工具链 (`cli/`)。
+> 工具链说明见 [TOOLCHAIN.md](TOOLCHAIN.md),立场声明见 [STATEMENT.md](STATEMENT.md)。
+> 以下为上游玄铁语言本身的文档,保留不动。
+
 [![版本](https://img.shields.io/badge/版本-0.18.0-red.svg)](https://gitee.com/mark-jy/xuantie)
 [![语言](https://img.shields.io/badge/语言-Go%20%7C%20LLVM-00ADD8.svg)](https://golang.org)
 [![许可证](https://img.shields.io/badge/许可证-MIT-green.svg)](LICENSE)

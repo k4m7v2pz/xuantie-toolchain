@@ -1,0 +1,17 @@
+[package]
+name = "xuantie"
+version = "0.1.0"
+edition = "2021"
+description = "玄铁 (XuanTie) 中文编程语言工具链 — cargo 风格 CLI"
+license = "Unlicense"
+license-file = "../LICENSE"
+
+[[bin]]
+name = "xuantie"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+notify = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
